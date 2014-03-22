@@ -96,66 +96,99 @@ sub LDAPsearch {
     my $return;
 
     # get entries
-    my $result = $ldap->search ( base       => $base,
-                                 scope      => $scope,
-                                 deref      => 'never',
-                                 filter     => "$filter");
+
+    # create a page object
+    my $page = Net::LDAP::Control::Paged->new( size => 100 ); # 100 results per page should work with every ldap implementation
+
+    my @args = ( base       => $base,
+        scope      => $scope,
+        deref      => 'never',
+        control  => [ $page ],
+        filter     => "$filter");
     beVerbose("LDAP SEARCH", "SEARCH '$filter' ON '$base'");
 
-    # error handling
-    if ($result->code) {
-        if ($result->code eq 4) {
-            $exit->{code} = 2;
-            $exit->{message} = "LDAP size limit exeeded: For OpenLDAP Server you need to set 'sizelimit unlimited' in /etc/slapd.conf";
-        } else {
+    my $cookie;
+    my $result_hash = {};
+
+    while (1) {
+        # Perform search
+        my $result = $ldap->search( @args );
+
+        # error handling
+        if ($result->code eq 3) {
             $exit->{code} = 3;
             $exit->{message} = "LDAP SEARCH ERROR: ".$result->error;
+            LeaveScript($exit->{code}, $exit->{message});
+        } elsif ($result->code) {
+            $exit->{code} = $result->code;
+            $exit->{message} = "UNKNOWN LDAP SEARCH ERROR: " . $result->error;
+            LeaveScript($exit->{code}, $exit->{message});
         }
-        LeaveScript($exit->{code}, $exit->{message});
-    }
 
-    # convert result to a hash
-    my $href = $result->as_struct;
+        # Set cookie in paged control
+        $page->cookie($cookie);
 
-    # get an array of the DN names
-    my @arrayOfDNs  = keys %$href;
+        # convert result to a hash
+        my $href = $result->as_struct;
 
-    # process each DN using it as a key
-    foreach (@arrayOfDNs) {
-        $return->{$_}->{dn} = $_;
-        my $valref = $$href{$_};
+        # get an array of the DN names
+        my @arrayOfDNs  = keys %$href;
 
-        # get an array of the attribute names
-        # passed for this one DN.
-        my @arrayOfAttrs = sort keys %$valref;
+        # process each DN using it as a key
+        foreach (@arrayOfDNs) {
+            $return->{$_}->{dn} = $_;
+            my $valref = $$href{$_};
 
-        foreach my $attrName(@arrayOfAttrs) {
-            # can't handle binary data => skip!
-            next if ( $attrName =~ /;binary$/ );
+            # get an array of the attribute names
+            # passed for this one DN.
+            my @arrayOfAttrs = sort keys %$valref;
 
-            # attribute name as the hash
-            my $attrVal =  @$valref{$attrName};
+            foreach my $attrName(@arrayOfAttrs) {
+                # can't handle binary data => skip!
+                next if ( $attrName =~ /;binary$/ );
 
-            # convert to an ordinary hash
-            my $counter = scalar @$attrVal;
-            while($counter != 0) {
-                $counter--;
-                if ($attrName eq "$cfg->{ldap}->{prefix}hostcustomvar" || $attrName eq "$cfg->{ldap}->{prefix}servicecustomvar") {
-                    @$attrVal[$counter] =~ m/([\d\w]*) (.*)/;
-                    $return->{$_}->{$attrName}->{$1} = $2;
-                    if(!defined($1)) {
-                        print("Warning: @$attrVal[$counter] in $_ is empty!\n");
+                # attribute name as the hash
+                my $attrVal =  @$valref{$attrName};
+
+                # convert to an ordinary hash
+                my $counter = scalar @$attrVal;
+                while($counter != 0) {
+                    $counter--;
+                    if ($attrName eq "$cfg->{ldap}->{prefix}hostcustomvar" || $attrName eq "$cfg->{ldap}->{prefix}servicecustomvar") {
+                        @$attrVal[$counter] =~ m/([\d\w]*) (.*)/;
+                        $return->{$_}->{$attrName}->{$1} = $2;
+                        if(!defined($1)) {
+                            print("Warning: @$attrVal[$counter] in $_ is empty!\n");
+                        }
+                    } elsif ($attrName eq "$cfg->{ldap}->{prefix}timeperiodvalue") {
+                        @$attrVal[$counter] =~ m/(.*) +([-\w:]+(\,?)+[-\w:]+)/;
+                        $return->{$_}->{$attrName}->{$counter}->{$1} = $2;
+                    } elsif ($attrName eq "description" || $attrName eq "objectclass") {
+                        $return->{$_}->{$attrName}->{@$attrVal[$counter]} = @$attrVal[$counter];
+                    } else {
+                        $return->{$_}->{$attrName} = @$attrVal[$counter];
                     }
-                } elsif ($attrName eq "$cfg->{ldap}->{prefix}timeperiodvalue") {
-                    @$attrVal[$counter] =~ m/(.*) +([-\w:]+(\,?)+[-\w:]+)/;
-                    $return->{$_}->{$attrName}->{$counter}->{$1} = $2;
-                } elsif ($attrName eq "description" || $attrName eq "objectclass") {
-                    $return->{$_}->{$attrName}->{@$attrVal[$counter]} = @$attrVal[$counter];
-                } else {
-                    $return->{$_}->{$attrName} = @$attrVal[$counter];
                 }
             }
         }
+
+        # merge the result with the other results
+
+        $result_hash = { %$result_hash, %$return };
+
+        # Get cookie from paged control
+        my($resp)  = $result->control( LDAP_CONTROL_PAGED )  or last;
+        $cookie    = $resp->cookie;
+        # Only continue if cookie is nonempty (= we're not done)
+        last  if (!defined($cookie) || !length($cookie));
+
+    }
+
+    if (defined($cookie) && length($cookie)) {
+        # We had an abnormal exit, so let the server know we do not want any more
+        $page->cookie($cookie);
+        $page->size(0);
+        $ldap->search( @args );
     }
 
     # and return the hash
